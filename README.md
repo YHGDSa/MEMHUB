@@ -2,11 +2,45 @@
 
 > **状态：参考实现（reference implementation）。** 这套 hub 在 2026-10-28 ~ 11-20 作为多 Agent 工作流的主记忆通道实际运行，上游服务恢复可用后归档停用。代码保留下来是因为它的**语义**（写入判据、离线补推、幂等去重、作用域隔离、凭据脱敏、单写者、跨机去重/墓碑/对账）比功能清单更有价值；下面每一条语义都由测试实际验证：`test/smoke.mjs` 41 条（单机）+ `test/multi-hub.mjs` 19 条（两机一上游）。
 
-一个零第三方依赖的本地优先记忆服务：**写入先落本地并返回成功**，同时投递 outbox；上游可用时按序补推，不可用时保留重试。目标是把「记忆」从「能存能查」做成一套**有生命周期约束**的工程件。
+一个零第三方依赖的本地优先记忆服务：**写入先落本地并返回成功**，同时投递 outbox；上游可用时按序补推，不可用时保留重试。目标是把「记忆」从「能存能查」做成一套**有生命周期约束**的工程件。能跑的命令在下一节。
+
+**目录**
+
+1. [快速开始：三条命令跑起来](#1-快速开始)
+2. [为什么做这个](#2-为什么做这个)
+3. [架构](#3-架构)
+4. [复用性：脱离上游也能用](#4-复用性能不能脱离上游用)
+5. [契约（API）](#5-契约)
+6. [语义：写入 / 去重 / 墓碑 / 对账](#6-语义这个项目真正的部分)
+7. [检索：为什么不是向量](#7-检索为什么不是向量)
+8. [目录](#10-目录)
+
+---
+
+## 1. 快速开始
+
+需要 Node ≥ 22.5（用到内置 `node:sqlite`），**零 npm 依赖**：不用 `npm install`，直接跑。
 
 ```bash
-node test/smoke.mjs       # 41 条断言：离线写入 → 恢复补推 → 去重 → 删除 → 作用域 → 脱敏 → 墓碑 → 快照
-node test/multi-hub.mjs   # 19 条断言：两台机器一个上游 → 重复收敛 → 修订传播 → 删除不复活 → 对账自愈
+cp config.example.json config.json
+# 1) 生成一个 secret，写进 config.secretFile 指向的文件
+node -e "console.log(require('crypto').randomBytes(24).toString('hex'))" > secret
+# 2) 起服务（参数是 config 路径，可省略）
+node src/hub.mjs ./config.json
+# 3) 健康检查（唯一免鉴权的端点）
+curl http://127.0.0.1:3111/agentmemory/livez
+# 4) 写一条、搜一条
+node src/mem.mjs put --title "示例" --content "断网时也要能写" --tags demo
+node src/mem.mjs get --query "断网"
+```
+
+> 中文内容请走 `--content-file` 或 `put-json --file`（UTF-8 文件体）。把非 ASCII 塞进命令行参数会被 shell 转成本地代码页，写进去就是坏数据——这是踩过的坑，不是防御性猜测。
+
+### 不用真上游也能验证
+
+```bash
+node test/smoke.mjs       # 41 条：离线写入 → 恢复补推 → 去重 → 删除 → 墓碑 → 快照
+node test/multi-hub.mjs   # 19 条：两机一上游 → 重复收敛 → 修订传播 → 删除不复活 → 对账自愈
 ```
 
 ```
@@ -14,9 +48,9 @@ node test/multi-hub.mjs   # 19 条断言：两台机器一个上游 → 重复�
 19/19 assertions passed   (two machines, one upstream)
 ```
 
----
+`test/multi-hub.mjs` 里的 stub 就是最小上游（可切换在线/离线），不需要第二台机器或云主机；两个套件都在 CI 里跑。
 
-## 1. 为什么做这个
+## 2. 为什么做这个
 
 多个编码 Agent（不同客户端、不同设备）各存各的上下文时，会出现三类问题：
 
@@ -26,7 +60,7 @@ node test/multi-hub.mjs   # 19 条断言：两台机器一个上游 → 重复�
 
 这三个问题都不是「换一个更强的检索算法」能解决的，而是**写入语义、幂等键、作用域与脱敏**的问题。这个项目就只做这四件事。
 
-## 2. 架构
+## 3. 架构
 
 ```
  Agent A / Agent B / CLI
@@ -49,7 +83,7 @@ node test/multi-hub.mjs   # 19 条断言：两台机器一个上游 → 重复�
 - **端口分工**：3111 永远属于本机 hub，隧道只用 3112。否则隧道会抢走 3111，客户端把上游当唯一真相，离线即失效。
 - **技能索引**：磁盘目录是唯一写者，`skills` 表只是索引；`POST /hub/skills` 直接 409。两处可写必然漂移。
 
-## 3. 复用性：能不能脱离上游用
+## 4. 复用性：能不能脱离上游用
 
 这个仓库的定位是「记忆语义的参考实现 + 可独立运行的本地服务」，不绑定任何特定上游。
 
@@ -68,25 +102,6 @@ node test/multi-hub.mjs   # 19 条断言：两台机器一个上游 → 重复�
 - 单写者假设：不支持多个进程同时写同一个库文件；也不支持多租户与按主体鉴权（单一 Bearer token）。
 - 没有 Docker 打包；`tools/tunnel-watchdog.py` 只在 Windows 下验证过。
 
-## 4. 快速开始
-
-需要 Node ≥ 22.5（用到内置 `node:sqlite`）。
-
-```bash
-cp config.example.json config.json
-# 1) 生成一个 secret，写进 config.secretFile 指向的文件
-node -e "console.log(require('crypto').randomBytes(24).toString('hex'))" > secret
-# 2) 起服务（第二个参数是 config 路径，可省略）
-node src/hub.mjs ./config.json
-# 3) 健康检查（唯一不需要鉴权的端点）
-curl http://127.0.0.1:3111/agentmemory/livez
-# {"service":"agentmemory","status":"ok","mode":"local-hub","upstream":"offline","memories":0,"pendingWrites":0}
-# 4) 写一条、搜一条
-node src/mem.mjs put --title "示例" --content "断网时也要能写" --tags demo
-node src/mem.mjs get --query "断网"
-```
-
-> 中文内容请走 `--content-file` 或 `put-json --file`（UTF-8 文件体）。把非 ASCII 塞进命令行参数会被 shell 转成本地代码页，写进去就是坏数据——这是踩过的坑，不是防御性猜测。
 
 ## 5. 契约
 
