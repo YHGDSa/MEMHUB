@@ -14,3 +14,5 @@ jobs:
           node-version: '24'
       - name: end-to-end smoke
         run: node test/smoke.mjs
+      - name: two-machine consistency
+        run: node test/multi-hub.mjs

@@ -1,15 +1,17 @@
 # 本地优先 Agent 记忆层（local-first agent memory）
 
-> **状态：参考实现（reference implementation）。** 这套 hub 在 2026-10-28 ~ 11-20 作为多 Agent 工作流的主记忆通道实际运行，上游服务恢复可用后归档停用。代码保留下来是因为它的**语义**（写入判据、离线补推、幂等去重、作用域隔离、凭据脱敏、单写者）比功能清单更有价值；下面每一条语义都由 `test/smoke.mjs` 的 37 条断言实际验证。
+> **状态：参考实现（reference implementation）。** 这套 hub 在 2026-10-28 ~ 11-20 作为多 Agent 工作流的主记忆通道实际运行，上游服务恢复可用后归档停用。代码保留下来是因为它的**语义**（写入判据、离线补推、幂等去重、作用域隔离、凭据脱敏、单写者、跨机去重/墓碑/对账）比功能清单更有价值；下面每一条语义都由测试实际验证：`test/smoke.mjs` 41 条（单机）+ `test/multi-hub.mjs` 19 条（两机一上游）。
 
 一个零第三方依赖的本地优先记忆服务：**写入先落本地并返回成功**，同时投递 outbox；上游可用时按序补推，不可用时保留重试。目标是把「记忆」从「能存能查」做成一套**有生命周期约束**的工程件。
 
 ```bash
-node test/smoke.mjs     # 37 条断言：离线写入 → 恢复补推 → 去重 → 删除 → 作用域 → 脱敏 → 快照
+node test/smoke.mjs       # 41 条断言：离线写入 → 恢复补推 → 去重 → 删除 → 作用域 → 脱敏 → 墓碑 → 快照
+node test/multi-hub.mjs   # 19 条断言：两台机器一个上游 → 重复收敛 → 修订传播 → 删除不复活 → 对账自愈
 ```
 
 ```
-37/37 assertions passed
+41/41 assertions passed   (single machine)
+19/19 assertions passed   (two machines, one upstream)
 ```
 
 ---
@@ -58,6 +60,7 @@ node test/smoke.mjs     # 37 条断言：离线写入 → 恢复补推 → 去�
 - **上游不可达时本地照常**：写入仍返回 200、检索走本地库、快照每 5 分钟刷新、outbox 累积待补推。`livez` 返回 `upstream:"offline"` 是**正常态**，不是故障。
 - **跨机共享需要你自备上游**：只要有一个实现以下四个端点的服务即可——`GET /agentmemory/livez`、`GET /agentmemory/export`、`POST /agentmemory/remember`、`POST /agentmemory/forget`。其余端点（`smart-search`、`memories`、`import`、`hub/status`、`hub/skills*`）都是本机能力，不需要上游。
 - **不知道上游该长什么样**：看 `test/smoke.mjs` 里的 `startStub`——它就是这四个端点的最小参考实现（可切换在线/离线），冒烟测试正是靠它验证离线写入与恢复补推。
+- **多机**：每台机器各跑一个 hub，共享同一个上游即可（离线优先仍在每台机器上）。三种拓扑与成本见 [`docs/topologies.md`](docs/topologies.md)，跨机去重 / 修订 / 删除的实现见 [`docs/consistency.md`](docs/consistency.md)。
 
 **明确的能力边界**
 
@@ -98,8 +101,10 @@ node src/mem.mjs get --query "断网"
 | GET | `/agentmemory/memories` | 按更新时间倒序列出 |
 | GET | `/agentmemory/export` | 全量导出（也是快照格式） |
 | POST | `/agentmemory/import` | 全量/增量导入，按 id upsert |
-| POST | `/agentmemory/forget` | 删除：`{memoryIds:[...]}`，同时取消未推送的 outbox |
-| POST | `/agentmemory/sync` | 手动同步：`{upstream, pull:{pulled,added}, push:{pending,pushed}}` |
+| POST | `/agentmemory/forget` | 删除：`{memoryIds:[...]}`，同时取消未推送的 outbox，并写入墓碑 |
+| POST | `/agentmemory/revise` | 修订：`{memoryId, title?, content?}`；保持同一 entity id，让其它机器按 LWW 覆盖旧版本 |
+| POST | `/agentmemory/sync` | 手动同步：`{upstream, pull:{pulled,added,merged,suppressed,cleaned}, push:{pending,pushed}}` |
+| POST | `/hub/reconcile` | 全量对账：按内容 id 收敛重复、按 entity id 压缩旧版本、重推缺失行、压缩过期墓碑 |
 | GET | `/hub/status` | 同步状态、上次报告、db 与快照路径 |
 | GET/POST | `/hub/skills`, `/hub/skills/reindex`, `/hub/skills/:name` | 技能索引（只读；POST 写入返回 409） |
 
@@ -125,6 +130,15 @@ node src/mem.mjs get --query "断网"
 **⑦ 冲突是 LWW（按 `updated_at`），不是分布式共识。**
 这个场景没有并发同 id 写入；把它写成「强一致」是过度声称。
 
+**⑧ 跨机去重靠内容 id，不靠上游。**
+每条记忆在写入时算出 `cid`（归一化后的 project/type/title/content 的哈希），并作为 `cid:<hash>` 标签随记录上行；拉取时同 cid 只保留一行。既然上游只保证存标签，去重就不需要它新增字段——详见 `docs/consistency.md`。
+
+**⑨ 删除写墓碑，而不是只删一行。**
+删除时记下 `cid` 墓碑、取消待推送、转发上游 forget，并追加一条 `type=tombstone` 的普通记录（带 `tomb:<cid>` 标签）。其它机器同步时看到墓碑就删掉自己的副本；墓碑 TTL（默认 30 天，`tombstoneTtlDays`）内重写同一内容返回 409，之后允许重新记录。
+
+**⑩ 修订共享 entity id，对账负责收敛。**
+`revise` 原地更新并追加一条同 `eid` 的新版本；其它机器按 eid 命中旧版本后 LWW 覆盖，不会多出一条平行事实。历史版本与重复行由 `POST /hub/reconcile` 统一清理，它还会重推上游缺失的行（self-heal）、压缩过期墓碑。
+
 ## 7. 检索：为什么不是向量
 
 单机规模（个位数项目、几十条记忆）、中文子串为主。打分是：
@@ -146,6 +160,7 @@ score   = min(1, raw * 0.85 + recency * 0.15)
 ## 9. 不做什么（明确边界）
 
 - 不是生产系统：单用户、双设备、约 3 周实际使用；没有压测、没有多租户、鉴权只有一个共享 secret。
+- 不是分布式系统：多机靠「追加 + 内容 id 去重 + 墓碑 + 全量对账」，不是共识协议；并发编辑同一条记忆会丢一侧（LWW）。
 - 不是记忆数据库：没有图索引、没有上下文压缩、没有 54 个 MCP 工具；这是契约子集。
 - 没有做召回评测：`docs/evaluation.md` 记录的是行为级演练，指标待测，不写成结果。
 - Docker/CI 之外没有部署产物：定位是「本机常驻的小服务」，不是可分发产品。
@@ -156,9 +171,12 @@ score   = min(1, raw * 0.85 + recency * 0.15)
 src/hub.mjs                服务本体（HTTP + SQLite + outbox + 快照 + 技能索引）
 src/mem.mjs                显式调用桥：put / put-json / get / list / status
 tools/tunnel-watchdog.py   端口看门狗：3111/3112 掉了才拉起，避免双开
-test/smoke.mjs             端到端冒烟：37 条断言，含一个可切换在线/离线的 stub 上游
+test/smoke.mjs             端到端冒烟：41 条断言，含一个可切换在线/离线的 stub 上游
+test/multi-hub.mjs         两机一上游：19 条断言（复制 / 去重 / 修订 / 删除 / 对账自愈）
 docs/architecture.md       组件、数据模型、四条主链路、不变量
-docs/decisions.md          8 条设计决策（备选 / 取舍 / 后果）
+docs/decisions.md          10 条设计决策（备选 / 取舍 / 后果）
+docs/topologies.md         三种部署拓扑：单机、双机、虚拟机/云上游与网络路径
+docs/consistency.md        跨机一致性：tags 携带 cid/eid/墓碑、对账的四个步骤与代价
 docs/evaluation.md         2026-10-28 演练记录 + 指标计划（诚实标注未测）
 docs/data-stats.md         数据规模一页（聚合口径）
 ```

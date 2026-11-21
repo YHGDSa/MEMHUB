@@ -271,7 +271,7 @@ try {
   const beforeQueued = (await api('GET', '/agentmemory/livez')).body.pendingWrites;
   await api('POST', '/agentmemory/forget', { memoryIds: [queued.body.memory.id] });
   const afterQueued = (await api('GET', '/agentmemory/livez')).body.pendingWrites;
-  eq('delete also cancels the queued push', afterQueued, beforeQueued - 1);
+  eq('queued write is cancelled and replaced by one tombstone', afterQueued, beforeQueued);
   stub.state.online = true;
   await syncStable();
   check('cancelled write never arrives upstream', !stub.state.memories.some((m) => m.title === '排队即删'));
@@ -303,6 +303,15 @@ try {
   const snap = JSON.parse(readFileSync(snapPath, 'utf8'));
   eq('snapshot count matches the live row count', snap.count, (await api('GET', '/agentmemory/livez')).body.memories);
   eq('snapshot is marked as local-hub origin', snap.origin, 'local-hub');
+
+  console.log('\n11. tombstones');
+  const tombs = stub.state.memories.filter((m) => m.type === 'tombstone');
+  check('delete travelled upstream as a tombstone record', tombs.length >= 1, `tombstones=${tombs.length}`);
+  const reap = await api('POST', '/agentmemory/remember', { title: '排队即删', content: '离线写入后马上删除，恢复后不应复活' });
+  eq('re-writing deleted content is refused while the tombstone lives', reap.status, 409);
+  const other = await api('POST', '/agentmemory/remember', { title: '排队即删', content: '内容不同就该允许写入' });
+  eq('different content is not blocked', other.status, 200);
+  eq('hub reports tombstone count', (await api('GET', '/agentmemory/livez')).body.tombstones >= 1, true);
 } catch (e) {
   check('unexpected error', false, e.message);
   console.error(e);

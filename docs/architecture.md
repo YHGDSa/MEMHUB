@@ -20,12 +20,13 @@
 ```sql
 memories(id TEXT PK, upstream_id TEXT, title, content, type, tags JSON,
          project, files JSON, scope, origin, created_at, updated_at,
-         version INT, remote INT)
+         version INT, remote INT, content_id TEXT, entity_id TEXT)
 outbox(seq INTEGER PK AUTOINCREMENT, kind, payload JSON, created_at,
-       synced_at, upstream_id, error)
+       synced_at, upstream_id, error)          -- kind: remember | tombstone
+tombstones(cid TEXT PK, entity_id, deleted_at, origin)
 skills(name, version, description, content, files JSON, tags JSON, created_at,
        PRIMARY KEY(name, version))     -- 由磁盘目录重建的只读索引
-meta(key TEXT PK, value)                -- last_sync_ok / last_sync_report
+meta(key TEXT PK, value)                -- last_sync_ok / last_sync_report / last_reconcile
 ```
 
 `upstream_id` 是幂等键：本地行记住“我在上游叫什么”，拉取时据此跳过自己。
@@ -66,20 +67,43 @@ single-flight 保护
 ### 3.4 删除（`POST /agentmemory/forget`）
 
 ```
-删 memories 行
+记墓碑（cid → deleted_at）
+  → 删 memories 行
   → 清掉 outbox 中该 id 的待推送（否则恢复后复活）
   → 尽力转发上游 forget（失败不回滚）
+  → 入队一条墓碑记录（remember，type=tombstone，tags=tomb:<cid>）
+```
+
+### 3.5 修订（`POST /agentmemory/revise`）
+
+```
+读旧行 → 脱敏新内容 → 新 cid → 原地更新（updated_at 刷新、version+1）
+      → 入队一条同 eid 的新记录（其它机器按 eid LWW 覆盖）
+```
+
+### 3.6 对账（`POST /hub/reconcile`）
+
+```
+pull（对齐到同一快照）
+  → 按 cid 分组：重复组保留最新，另发上游 forget
+  → 按 eid 分组：旧版本发上游 forget
+  → 本地按 cid 去重
+  → 本地已推但上游缺失的行重新入队（self-heal）
+  → 过期墓碑：删本地标记 + forget 上游墓碑记录
 ```
 
 ## 4. 不变量
 
 1. 本地写成功即返回成功，上游可达性只影响同步报告。
 2. 同一条记忆在本地最多一行；`upstream_id` 唯一解释“这条是否已上浮”。
-3. `private` 不产生 outbox 行，因此不存在“忘了过滤”的路径。
-4. 落库内容一定已经过脱敏；库里的正文不含匹配到的凭据。
-5. 技能只有磁盘一个写者；HTTP 写入恒为 409。
-6. 快照要么是旧的完整文件，要么是新的完整文件（tmp + rename），不会是半个。
-7. 单写者：同一时刻只有一个进程打开主库。
+3. 同一内容在本地最多一行；`content_id`（cid）唯一解释“这是不是同一条事实”。
+4. `private` 不产生 outbox 行，因此不存在“忘了过滤”的路径。
+5. 落库内容一定已经过脱敏；库里的正文不含匹配到的凭据。
+6. 技能只有磁盘一个写者；HTTP 写入恒为 409。
+7. 快照要么是旧的完整文件，要么是新的完整文件（tmp + rename），不会是半个。
+8. 单写者：同一时刻只有一个进程打开主库。
+9. 墓碑不进 `memories`、不进检索、不进快照；它只在同步与对账时被读取。
+10. 同一 cid 在墓碑 TTL 内不允许重新落库（409），TTL 过后允许。
 
 ## 5. 故障对照
 

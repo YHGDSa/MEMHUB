@@ -9,8 +9,9 @@
   },
   "scripts": {
     "start": "node src/hub.mjs",
-    "test": "node test/smoke.mjs",
-    "smoke": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs && node test/multi-hub.mjs",
+    "smoke": "node test/smoke.mjs",
+    "multi": "node test/multi-hub.mjs"
   },
   "license": "MIT"
 }

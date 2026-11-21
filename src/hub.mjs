@@ -12,6 +12,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
@@ -66,21 +67,101 @@ db.exec(`
     PRIMARY KEY (name, version)
   );
   CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+  -- Deletion markers. A tombstone is local state, not a memory: it never shows
+  -- up in search or in the snapshot, but it stops a deleted fact from being
+  -- resurrected by another machine's copy.
+  CREATE TABLE IF NOT EXISTS tombstones (
+    cid        TEXT PRIMARY KEY,
+    entity_id  TEXT,
+    deleted_at TEXT NOT NULL,
+    origin     TEXT
+  );
   CREATE INDEX IF NOT EXISTS idx_mem_updated ON memories(updated_at);
 `);
 
-// Older databases predate provenance passthrough; add the column in place.
-if (!db.prepare('PRAGMA table_info(memories)').all().some((c) => c.name === 'files')) {
-  db.exec("ALTER TABLE memories ADD COLUMN files TEXT NOT NULL DEFAULT '[]'");
+// Older databases predate these columns; add them in place instead of asking
+// users to migrate by hand.
+const columns = new Set(db.prepare('PRAGMA table_info(memories)').all().map((c) => c.name));
+for (const [name, ddl] of [
+  ['files', "ALTER TABLE memories ADD COLUMN files TEXT NOT NULL DEFAULT '[]'"],
+  ['scope', "ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'"],
+  ['content_id', 'ALTER TABLE memories ADD COLUMN content_id TEXT'],
+  ['entity_id', 'ALTER TABLE memories ADD COLUMN entity_id TEXT'],
+]) {
+  if (!columns.has(name)) db.exec(ddl);
 }
-if (!db.prepare('PRAGMA table_info(memories)').all().some((c) => c.name === 'scope')) {
-  db.exec("ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'");
-}
+db.exec('CREATE INDEX IF NOT EXISTS idx_mem_cid ON memories(content_id)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_mem_eid ON memories(entity_id)');
 
 const nowIso = () => new Date().toISOString();
 const j = (v) => JSON.stringify(v ?? null);
 // `private` never leaves this machine: no outbox row, so it cannot be pushed.
 const SCOPES = new Set(['global', 'project', 'agent', 'private']);
+
+/* ---------- identity ---------- */
+// Two machines may record the same fact independently. A content id derived
+// from the normalised record lets both ends recognise it as one thing without
+// asking the upstream to deduplicate anything.
+const TOMBSTONE_TYPE = 'tombstone';
+const CID_TAG = 'cid:';
+const EID_TAG = 'eid:';
+const TOMB_TAG = 'tomb:';
+const TOMBSTONE_TTL_DAYS = Number(cfg.tombstoneTtlDays ?? 30);
+const TOMBSTONES_ON = cfg.tombstones !== false;
+
+const norm = (s) => String(s ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+function cidOf({ title, content, project, type } = {}) {
+  return createHash('sha256')
+    .update([norm(project), norm(type || 'fact'), norm(title), norm(content)].join('\u0000'))
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function tagValue(tags, prefix) {
+  const hit = (Array.isArray(tags) ? tags : []).find((t) => String(t).startsWith(prefix));
+  return hit ? String(hit).slice(prefix.length) : null;
+}
+
+// Metadata travels in tags, so it survives any upstream that only stores
+// tags/concepts -- no new endpoint or field is required from the replica.
+function metaOf(m) {
+  const tags = Array.isArray(m.tags) ? m.tags : (Array.isArray(m.concepts) ? m.concepts : []);
+  const isTombstone = m.type === TOMBSTONE_TYPE || tags.some((t) => String(t).startsWith(TOMB_TAG));
+  const cid = m.contentId || m.content_id || tagValue(tags, CID_TAG) || tagValue(tags, TOMB_TAG)
+    || (isTombstone ? null : cidOf(m));
+  const eid = m.entityId || m.entity_id || tagValue(tags, EID_TAG) || m.id || null;
+  return { tags, isTombstone, cid, eid };
+}
+
+function mergeTags(base, cid, eid) {
+  const out = (Array.isArray(base) ? base : [])
+    .filter((t) => !String(t).startsWith(CID_TAG) && !String(t).startsWith(EID_TAG) && !String(t).startsWith(TOMB_TAG));
+  if (cid) out.push(CID_TAG + cid);
+  if (eid) out.push(EID_TAG + eid);
+  return out;
+}
+
+// A tombstone suppresses the same content on every replica for a bounded time;
+// after the TTL the fact can be recorded again on purpose.
+function liveTombstones() {
+  const cutoff = new Date(Date.now() - TOMBSTONE_TTL_DAYS * 86400000).toISOString();
+  return new Set(db.prepare('SELECT cid FROM tombstones WHERE deleted_at > ?').all(cutoff).map((r) => r.cid));
+}
+
+function addTombstone(cid, entityId, when, origin) {
+  if (!cid) return;
+  db.prepare('INSERT OR REPLACE INTO tombstones(cid, entity_id, deleted_at, origin) VALUES(?, ?, ?, ?)')
+    .run(cid, entityId || null, when || nowIso(), origin || 'local');
+}
+
+// Rows written before content ids existed still need an identity, otherwise
+// cross-machine dedup silently skips them.
+for (const r of db.prepare('SELECT id, title, content, project, type, tags, content_id, entity_id FROM memories WHERE content_id IS NULL OR entity_id IS NULL').all()) {
+  const cid = r.content_id || cidOf(r);
+  const eid = r.entity_id || r.id;
+  db.prepare('UPDATE memories SET content_id = ?, entity_id = ?, tags = ? WHERE id = ?')
+    .run(cid, eid, j(mergeTags(JSON.parse(r.tags || '[]'), cid, eid)), r.id);
+}
 
 function metaGet(k, dflt = null) {
   const r = db.prepare('SELECT value FROM meta WHERE key = ?').get(k);
@@ -136,13 +217,14 @@ function upsertMemory(m) {
   const files = Array.isArray(m.files) ? m.files : [];
   const scope = SCOPES.has(m.scope) ? m.scope : 'global';
   const origin = typeof m.origin === 'object' && m.origin ? (m.origin.channel || 'remote') : (m.origin || 'remote');
+  const meta = metaOf(m);
   const stmt = db.prepare(`
-    INSERT INTO memories (id, upstream_id, title, content, type, tags, project, files, scope, origin, created_at, updated_at, version, remote)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO memories (id, upstream_id, title, content, type, tags, project, files, scope, origin, created_at, updated_at, version, remote, content_id, entity_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       title = excluded.title, content = excluded.content, type = excluded.type,
       tags = excluded.tags, project = excluded.project, files = excluded.files, scope = excluded.scope,
-      updated_at = excluded.updated_at,
+      updated_at = excluded.updated_at, content_id = excluded.content_id, entity_id = excluded.entity_id,
       version = excluded.version, upstream_id = excluded.upstream_id, remote = excluded.remote
     WHERE excluded.updated_at >= memories.updated_at
   `);
@@ -150,7 +232,7 @@ function upsertMemory(m) {
     m.id, m.upstream_id ?? (m.remote ? m.id : null), m.title || '(untitled)', m.content || '',
     m.type || 'fact', j(tags), m.project ?? null, j(files), scope, origin,
     m.createdAt || m.created_at || nowIso(), m.updatedAt || m.updated_at || nowIso(),
-    Number(m.version || 1), m.remote ? 1 : 0,
+    Number(m.version || 1), m.remote ? 1 : 0, meta.cid, meta.eid,
   );
 }
 
@@ -171,6 +253,8 @@ function rowToMemory(r) {
     version: r.version,
     isLatest: true,
     source: r.remote ? 'upstream' : 'local',
+    contentId: r.content_id || undefined,
+    entityId: r.entity_id || undefined,
   };
 }
 
@@ -272,18 +356,74 @@ async function pullUpstream() {
   const res = await upstreamFetch('/agentmemory/export', { method: 'GET' }, 180000);
   if (!res.ok) throw new Error(`export ${res.status}`);
   const memories = res.body?.memories || [];
+  const tomb = liveTombstones();
+  const knownUpstream = new Set(
+    db.prepare('SELECT upstream_id FROM memories WHERE upstream_id IS NOT NULL').all().map((r) => r.upstream_id),
+  );
   let added = 0;
+  let merged = 0;
+  let suppressed = 0;
+  let cleaned = 0;
+
   for (const m of memories) {
-    // A locally-originated memory keeps its local id and records the upstream id
-    // in upstream_id (set by pushOutbox). Pulling that same record back under the
-    // upstream id would make it a second row with identical content.
-    if (m.id && db.prepare('SELECT id FROM memories WHERE upstream_id = ?').get(m.id)) continue;
+    if (!m?.id) continue;
+    const meta = metaOf(m);
+
+    // 1) tombstones: record the deletion and drop any local copy of that content
+    if (meta.isTombstone) {
+      if (meta.cid) {
+        const already = db.prepare('SELECT deleted_at FROM tombstones WHERE cid = ?').get(meta.cid);
+        if (!already) {
+          addTombstone(meta.cid, meta.eid, m.updatedAt || m.updated_at || nowIso(), 'upstream');
+          tomb.add(meta.cid);
+        }
+        for (const row of db.prepare('SELECT id FROM memories WHERE content_id = ?').all(meta.cid)) {
+          db.prepare('DELETE FROM memories WHERE id = ?').run(row.id);
+          suppressed++;
+        }
+      }
+      continue;
+    }
+
+    // 2) our own pushed row: already local, nothing to do
+    if (knownUpstream.has(m.id) || db.prepare('SELECT id FROM memories WHERE upstream_id = ?').get(m.id)) continue;
+
+    // 3) content deleted elsewhere: do not insert, and clean the stale upstream copy
+    if (meta.cid && tomb.has(meta.cid)) {
+      await upstreamFetch('/agentmemory/forget', { method: 'POST', body: JSON.stringify({ memoryId: m.id }) }, 60000).catch(() => {});
+      cleaned++;
+      continue;
+    }
+
+    // 4) same content already present under another id: keep one row
+    const byCid = db.prepare('SELECT * FROM memories WHERE content_id = ?').get(meta.cid);
+    if (byCid) {
+      if (String(m.updatedAt || '') > String(byCid.updated_at)) {
+        db.prepare('UPDATE memories SET updated_at = ? WHERE id = ?').run(m.updatedAt, byCid.id);
+        merged++;
+      }
+      continue;
+    }
+
+    // 5) newer version of the same logical memory (revision): last write wins
+    const byEid = db.prepare('SELECT * FROM memories WHERE entity_id = ? ORDER BY updated_at DESC').get(meta.eid);
+    if (byEid) {
+      if (String(m.updatedAt || '') > String(byEid.updated_at)) {
+        db.prepare('UPDATE memories SET title = ?, content = ?, content_id = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+          .run(m.title || byEid.title, m.content || '', meta.cid, m.updatedAt || nowIso(), byEid.id);
+        merged++;
+      }
+      continue;
+    }
+
+    // 6) genuinely new to this machine
     const before = db.prepare('SELECT updated_at FROM memories WHERE id = ?').get(m.id);
-    upsertMemory({ ...m, remote: true });
+    upsertMemory({ ...m, remote: true, content_id: meta.cid, entity_id: meta.eid });
     if (!before) added++;
   }
+
   writeSnapshot();
-  return { pulled: memories.length, added };
+  return { pulled: memories.length, added, merged, suppressed, cleaned };
 }
 
 async function pushOutbox() {
@@ -291,13 +431,27 @@ async function pushOutbox() {
   let pushed = 0;
   for (const row of rows) {
     const payload = JSON.parse(row.payload);
-    const body = { title: payload.title, content: payload.content };
-    // Upstream stores keywords as `concepts`; sending only `tags` silently loses them.
-    if (payload.tags?.length) body.tags = payload.tags;
-    body.concepts = payload.tags || [];
-    if (payload.project) body.project = payload.project;
-    if (payload.type) body.type = payload.type;
-    if (payload.files?.length) body.files = payload.files;
+    let body;
+    if (row.kind === 'tombstone') {
+      // A tombstone is a normal record carrying the deleted content id, so any
+      // replica that only speaks remember/export/forget can still carry it.
+      body = {
+        title: `tombstone:${payload.cid}`,
+        content: '[deleted]',
+        type: TOMBSTONE_TYPE,
+        tags: [`${TOMB_TAG}${payload.cid}`, `${CID_TAG}${payload.cid}`, `${EID_TAG}${payload.entityId || ''}`],
+        concepts: [`${TOMB_TAG}${payload.cid}`, `${CID_TAG}${payload.cid}`],
+      };
+      if (payload.project) body.project = payload.project;
+    } else {
+      body = { title: payload.title, content: payload.content };
+      // Upstream stores keywords as `concepts`; sending only `tags` silently loses them.
+      if (payload.tags?.length) body.tags = payload.tags;
+      body.concepts = payload.tags || [];
+      if (payload.project) body.project = payload.project;
+      if (payload.type) body.type = payload.type;
+      if (payload.files?.length) body.files = payload.files;
+    }
     const res = await upstreamFetch('/agentmemory/remember', {
       method: 'POST',
       body: JSON.stringify(body),
@@ -364,6 +518,7 @@ route('GET', '/agentmemory/livez', () => ({
   upstream: upstreamState.online ? 'online' : 'offline',
   memories: db.prepare('SELECT COUNT(*) c FROM memories').get().c,
   pendingWrites: db.prepare('SELECT COUNT(*) c FROM outbox WHERE synced_at IS NULL').get().c,
+  tombstones: db.prepare('SELECT COUNT(*) c FROM tombstones').get().c,
 }));
 
 route('GET', '/agentmemory/health', () => ({
@@ -373,25 +528,38 @@ route('GET', '/agentmemory/health', () => ({
   upstream: upstreamState,
   lastSyncOk: metaGet('last_sync_ok'),
   memories: db.prepare('SELECT COUNT(*) c FROM memories').get().c,
+  tombstones: db.prepare('SELECT COUNT(*) c FROM tombstones').get().c,
   skills: db.prepare('SELECT COUNT(DISTINCT name) c FROM skills').get().c,
 }));
 
 route('POST', '/agentmemory/remember', (body) => {
   const ts = nowIso();
   const id = `mem_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 12)}`;
-  const tags = Array.isArray(body.tags) ? body.tags : (Array.isArray(body.concepts) ? body.concepts : []);
+  const baseTags = Array.isArray(body.tags) ? body.tags : (Array.isArray(body.concepts) ? body.concepts : []);
   const scope = body.scope ?? 'global';
   if (!SCOPES.has(scope)) throw Object.assign(new Error(`unknown scope: ${scope}`), { status: 400 });
   const title = redact(body.title || (body.content || '').slice(0, 80) || '(untitled)');
   const content = redact(body.content || '');
+  const type = body.type || 'fact';
+  const project = body.project ?? null;
+  const cid = cidOf({ title: title.text, content: content.text, project, type });
+  const entityId = body.entityId || `e_${createHash('sha256').update(`${id}`).digest('hex').slice(0, 12)}`;
+
+  // A deleted fact stays deleted on every replica for the tombstone TTL, even
+  // if another agent writes it again by accident.
+  if (scope !== 'private' && TOMBSTONES_ON && liveTombstones().has(cid)) {
+    throw Object.assign(new Error('tombstoned: this content was deleted; wait for the tombstone TTL or write it as a new fact'), { status: 409 });
+  }
+
+  const tags = mergeTags(baseTags, cid, entityId);
   const memory = {
     id,
     upstream_id: null,
     title: title.text,
     content: content.text,
-    type: body.type || 'fact',
+    type,
     tags,
-    project: body.project ?? null,
+    project,
     files: Array.isArray(body.files) ? body.files : [],
     scope,
     origin: 'local-hub',
@@ -399,6 +567,8 @@ route('POST', '/agentmemory/remember', (body) => {
     updatedAt: ts,
     version: 1,
     remote: 0,
+    content_id: cid,
+    entity_id: entityId,
   };
   upsertMemory(memory);
   if (scope !== 'private') {
@@ -410,6 +580,32 @@ route('POST', '/agentmemory/remember', (body) => {
   }
   const saved = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
   if (scope !== 'private' && upstreamState.online) syncNow('write').catch(() => {});
+  return { success: true, redacted: title.hits + content.hits, memory: rowToMemory(saved) };
+});
+
+// Revisions keep the same entity id, so other machines resolve them by
+// last-write-wins instead of storing a second, unrelated fact.
+route('POST', '/agentmemory/revise', (body) => {
+  const id = body.memoryId || body.id;
+  const row = id ? db.prepare('SELECT * FROM memories WHERE id = ?').get(id) : null;
+  if (!row) throw Object.assign(new Error('memory not found'), { status: 404 });
+  const title = redact(body.title ?? row.title);
+  const content = redact(body.content ?? row.content);
+  const ts = nowIso();
+  const cid = cidOf({ title: title.text, content: content.text, project: row.project, type: row.type });
+  const entityId = row.entity_id || row.id;
+  const tags = mergeTags(JSON.parse(row.tags || '[]'), cid, entityId);
+  db.prepare('UPDATE memories SET title = ?, content = ?, content_id = ?, tags = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+    .run(title.text, content.text, cid, j(tags), ts, id);
+  if (row.scope !== 'private') {
+    db.prepare('INSERT INTO outbox(kind, payload, created_at) VALUES(?, ?, ?)').run(
+      'remember',
+      j({ memoryId: id, title: title.text, content: content.text, tags, files: JSON.parse(row.files || '[]'), project: row.project, type: row.type }),
+      ts,
+    );
+    if (upstreamState.online) syncNow('revise').catch(() => {});
+  }
+  const saved = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
   return { success: true, redacted: title.hits + content.hits, memory: rowToMemory(saved) };
 });
 
@@ -445,30 +641,158 @@ route('POST', '/agentmemory/import', (body) => {
 route('POST', '/agentmemory/forget', async (body) => {
   const ids = body.memoryIds || (body.memoryId ? [body.memoryId] : []);
   let removed = 0;
+  let tombstones = 0;
   for (const id of ids) {
-    const row = db.prepare('SELECT upstream_id FROM memories WHERE id = ?').get(id);
-    db.prepare('DELETE FROM memories WHERE id = ?').run(id);
-    // Drop any queued write for this id, otherwise the next replay recreates
-    // it upstream -- deleting while the upstream is offline would silently undo
-    // itself minutes later.
-    for (const o of db.prepare("SELECT seq, payload FROM outbox WHERE kind = 'remember'").all()) {
-      let mid = null;
-      try {
-        mid = JSON.parse(o.payload).memoryId;
-      } catch {
-        mid = null;
+    const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
+    const ts = nowIso();
+    if (row) {
+      const cid = row.content_id || cidOf({ title: row.title, content: row.content, project: row.project, type: row.type });
+      if (cid) {
+        addTombstone(cid, row.entity_id || id, ts, 'local');
+        tombstones++;
+        // Tell the replicas that this content is gone. A tombstone is a regular
+        // record, so it travels through the same remember/export path.
+        if (TOMBSTONES_ON && row.scope !== 'private') {
+          db.prepare('INSERT INTO outbox(kind, payload, created_at) VALUES(?, ?, ?)').run(
+            'tombstone',
+            j({ cid, entityId: row.entity_id || id, project: row.project ?? null }),
+            ts,
+          );
+        }
       }
-      if (mid === id) db.prepare('DELETE FROM outbox WHERE seq = ?').run(o.seq);
-    }
-    removed++;
-    const upstreamId = row?.upstream_id || (String(id).startsWith('mem_') && upstreamState.online ? id : null);
-    if (upstreamId) {
-      await upstreamFetch('/agentmemory/forget', { method: 'POST', body: JSON.stringify({ memoryId: upstreamId }) }, 60000).catch(() => {});
+      db.prepare('DELETE FROM memories WHERE id = ?').run(id);
+      // Drop any queued write for this id, otherwise the next replay recreates
+      // it upstream -- deleting while the upstream is offline would silently undo
+      // itself minutes later.
+      for (const o of db.prepare("SELECT seq, payload FROM outbox WHERE kind = 'remember'").all()) {
+        let mid = null;
+        try {
+          mid = JSON.parse(o.payload).memoryId;
+        } catch {
+          mid = null;
+        }
+        if (mid === id) db.prepare('DELETE FROM outbox WHERE seq = ?').run(o.seq);
+      }
+      removed++;
+      if (row.upstream_id) {
+        await upstreamFetch('/agentmemory/forget', { method: 'POST', body: JSON.stringify({ memoryId: row.upstream_id }) }, 60000).catch(() => {});
+      }
     }
   }
   writeSnapshot();
-  return { success: true, removed };
+  return { success: true, removed, tombstones };
 });
+
+// Full reconciliation: compare this machine with the whole upstream set and
+// repair what incremental sync cannot see -- duplicates created by two machines
+// recording the same fact, stale versions left by a revision, and rows that
+// vanished upstream while nobody was looking.
+async function reconcile() {
+  const startedAt = nowIso();
+  const report = { at: startedAt, upstream: false, pulled: 0, added: 0, merged: 0, suppressed: 0, cleaned: 0, dupsRemoved: 0, versionsRemoved: 0, localDupsRemoved: 0, repushed: 0, tombstonesCompacted: 0 };
+  const health = await upstreamFetch('/agentmemory/livez', { method: 'GET' }, 30000);
+  if (!health.ok) throw new Error(`upstream unreachable: ${health.status}`);
+  report.upstream = true;
+
+  const pulled = await pullUpstream();
+  Object.assign(report, { pulled: pulled.pulled, added: pulled.added, merged: pulled.merged, suppressed: pulled.suppressed, cleaned: pulled.cleaned });
+
+  const res = await upstreamFetch('/agentmemory/export', { method: 'GET' }, 180000);
+  if (!res.ok) throw new Error(`export ${res.status}`);
+  const memories = res.body?.memories || [];
+  const tomb = liveTombstones();
+
+  // 1) upstream duplicates: one cid, several rows -> keep the newest, forget the rest
+  const groups = new Map();
+  const tombstoneRows = [];
+  for (const m of memories) {
+    if (!m?.id) continue;
+    const meta = metaOf(m);
+    if (meta.isTombstone) { tombstoneRows.push({ m, meta }); continue; }
+    if (meta.cid && tomb.has(meta.cid)) {
+      const r = await upstreamFetch('/agentmemory/forget', { method: 'POST', body: JSON.stringify({ memoryId: m.id }) }, 60000).catch(() => null);
+      if (r?.ok) report.cleaned++;
+      continue;
+    }
+    if (!groups.has(meta.cid)) groups.set(meta.cid, []);
+    groups.get(meta.cid).push(m);
+  }
+  for (const list of groups.values()) {
+    if (list.length < 2) continue;
+    list.sort((a, b) => String(b.updatedAt || b.updated_at || '').localeCompare(String(a.updatedAt || a.updated_at || '')));
+    for (const loser of list.slice(1)) {
+      const r = await upstreamFetch('/agentmemory/forget', { method: 'POST', body: JSON.stringify({ memoryId: loser.id }) }, 60000).catch(() => null);
+      if (r?.ok) report.dupsRemoved++;
+    }
+  }
+
+  // 1b) stale versions of the same logical memory: only the newest one belongs
+  //     on the replica, otherwise every revision permanently grows the export
+  const live = memories.filter((m) => m?.id && !metaOf(m).isTombstone && !tomb.has(metaOf(m).cid));
+  const versions = new Map();
+  for (const m of live) {
+    const eid = metaOf(m).eid;
+    if (!eid) continue;
+    if (!versions.has(eid)) versions.set(eid, []);
+    versions.get(eid).push(m);
+  }
+  for (const list of versions.values()) {
+    if (list.length < 2) continue;
+    list.sort((a, b) => String(b.updatedAt || b.updated_at || '').localeCompare(String(a.updatedAt || a.updated_at || '')));
+    for (const loser of list.slice(1)) {
+      const r = await upstreamFetch('/agentmemory/forget', { method: 'POST', body: JSON.stringify({ memoryId: loser.id }) }, 60000).catch(() => null);
+      if (r?.ok) report.versionsRemoved++;
+    }
+  }
+
+  // 2) local duplicates (same cid twice on this machine)
+  for (const d of db.prepare('SELECT content_id, COUNT(*) c FROM memories WHERE content_id IS NOT NULL GROUP BY content_id HAVING c > 1').all()) {
+    const rows = db.prepare('SELECT id FROM memories WHERE content_id = ? ORDER BY updated_at DESC').all(d.content_id);
+    for (const r of rows.slice(1)) {
+      db.prepare('DELETE FROM memories WHERE id = ?').run(r.id);
+      report.localDupsRemoved++;
+    }
+  }
+
+  // 3) self-heal: a row we once pushed but which is gone upstream and is not
+  //    represented there by the same content id -> push it again
+  const upstreamIds = new Set(memories.map((m) => m.id));
+  const upstreamCids = new Set(memories.filter((m) => !metaOf(m).isTombstone).map((m) => metaOf(m).cid));
+  for (const r of db.prepare('SELECT * FROM memories WHERE upstream_id IS NOT NULL AND remote = 0').all()) {
+    if (upstreamIds.has(r.upstream_id)) continue;
+    if (r.content_id && upstreamCids.has(r.content_id)) continue;
+    if (r.content_id && tomb.has(r.content_id)) continue;
+    db.prepare('INSERT INTO outbox(kind, payload, created_at) VALUES(?, ?, ?)').run(
+      'remember',
+      j({ memoryId: r.id, title: r.title, content: r.content, tags: JSON.parse(r.tags || '[]'), files: JSON.parse(r.files || '[]'), project: r.project, type: r.type }),
+      nowIso(),
+    );
+    report.repushed++;
+  }
+  if (report.repushed) Object.assign(report, { push: await pushOutbox() });
+
+  // 4) compact expired tombstones (TTL passed): drop local marker, forget the
+  //    upstream tombstone record so export does not grow forever
+  const cutoff = new Date(Date.now() - TOMBSTONE_TTL_DAYS * 86400000).toISOString();
+  for (const t of db.prepare('SELECT cid FROM tombstones WHERE deleted_at <= ?').all(cutoff)) {
+    db.prepare('DELETE FROM tombstones WHERE cid = ?').run(t.cid);
+    report.tombstonesCompacted++;
+  }
+  for (const { m, meta } of tombstoneRows) {
+    if (!meta.cid) continue;
+    const local = db.prepare('SELECT deleted_at FROM tombstones WHERE cid = ?').get(meta.cid);
+    if (local && local.deleted_at <= cutoff) {
+      const r = await upstreamFetch('/agentmemory/forget', { method: 'POST', body: JSON.stringify({ memoryId: m.id }) }, 60000).catch(() => null);
+      if (r?.ok) report.tombstonesCompacted++;
+    }
+  }
+
+  writeSnapshot();
+  metaSet('last_reconcile', JSON.stringify(report));
+  return report;
+}
+
+route('POST', '/hub/reconcile', async () => reconcile());
 
 route('POST', '/agentmemory/sync', async () => syncNow('manual'));
 
