@@ -1,0 +1,12 @@
+# data
+hub.db
+hub.db-wal
+hub.db-shm
+snap/
+*.log
+secret
+config.json
+
+# node
+node_modules/
+test/.tmp/

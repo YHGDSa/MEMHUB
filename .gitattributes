@@ -1,0 +1,4 @@
+# Normalize line endings across platforms; Windows batch/PowerShell stay CRLF.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

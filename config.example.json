@@ -1,0 +1,9 @@
+{
+  "port": 3111,
+  "upstream": "http://127.0.0.1:3112",
+  "secretFile": "./secret",
+  "db": "hub.db",
+  "syncIntervalMs": 60000,
+  "snapDir": "./snap",
+  "skillsDir": "./skills"
+}
