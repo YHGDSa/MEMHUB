@@ -1,46 +1,54 @@
-# 本地优先 Agent 记忆层（local-first agent memory）
+<p align="right"><a href="README.zh-CN.md">简体中文</a> · <b>English</b></p>
 
-> **状态：参考实现（reference implementation）。** 这套 hub 在 2026-10-28 ~ 11-20 作为多 Agent 工作流的主记忆通道实际运行，上游服务恢复可用后归档停用。代码保留下来是因为它的**语义**（写入判据、离线补推、幂等去重、作用域隔离、凭据脱敏、单写者、跨机去重/墓碑/对账）比功能清单更有价值；下面每一条语义都由测试实际验证：`test/smoke.mjs` 41 条（单机）+ `test/multi-hub.mjs` 19 条（两机一上游）。
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="MEMHUB — local-first memory hub for multi-agent workflows" width="100%">
+</p>
 
-一个零第三方依赖的本地优先记忆服务：**写入先落本地并返回成功**，同时投递 outbox；上游可用时按序补推，不可用时保留重试。目标是把「记忆」从「能存能查」做成一套**有生命周期约束**的工程件。能跑的命令在下一节。
+# MEMHUB · local-first agent memory
 
-**目录**
+`local-first-agent-memory` · reference implementation · Node ≥ 22.5 · zero npm dependencies · [![smoke](https://github.com/YHGDSa/local-first-agent-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/YHGDSa/local-first-agent-memory/actions)
 
-1. [快速开始（含可运行命令）](#1-快速开始)
-2. [为什么做这个](#2-为什么做这个)
-3. [架构](#3-架构)
-4. [复用性：脱离上游也能用](#4-复用性能不能脱离上游用)
-5. [契约（API）](#5-契约)
-6. [语义：写入 / 去重 / 墓碑 / 对账](#6-语义这个项目真正的部分)
-7. [检索：为什么不是向量](#7-检索为什么不是向量)
-8. [仓库结构](#10-目录)
+> **Status: reference implementation.** This hub ran as the primary memory path for a multi-agent workflow from 2026-10-28 to 11-20, then was retired when the upstream service became usable and the workflow moved back to it. The code is kept because its **semantics** — write criterion, outbox replay, idempotent dedup, scope isolation, credential redaction, single writer, cross-machine dedup/tombstones/reconcile — are worth more than a feature list. Every claim below is covered by tests: `test/smoke.mjs` 41 assertions (single machine) + `test/multi-hub.mjs` 19 assertions (two machines, one upstream).
+
+A zero-dependency, local-first memory service: **a write succeeds locally first**, and is queued in an outbox; the upstream receives it later, when it is reachable. The goal is to turn "memory" from a store-and-query feature into an engineering component with **lifecycle constraints**. Runnable commands are in the next section.
+
+**Contents**
+
+1. [Quick start](#1-quick-start)
+2. [Why this exists](#2-why-this-exists)
+3. [Architecture](#3-architecture)
+4. [Reusability: can it run without an upstream?](#4-reusability-can-it-run-without-an-upstream)
+5. [Contract](#5-contract)
+6. [Semantics](#6-semantics-the-part-that-matters)
+7. [Retrieval: why not vectors](#7-retrieval-why-not-vectors)
+8. [Layout](#10-layout)
 
 ---
 
-## 1. 快速开始
+## 1. Quick start
 
-需要 Node ≥ 22.5（用到内置 `node:sqlite`），**零 npm 依赖**：不用 `npm install`，直接跑。
+Node ≥ 22.5 (uses the built-in `node:sqlite`) and **zero npm dependencies**: no `npm install`, just run it.
 
 ```bash
 cp config.example.json config.json
-# 1) 生成一个 secret，写进 config.secretFile 指向的文件
+# 1) generate a secret and put it where config.secretFile points
 node -e "console.log(require('crypto').randomBytes(24).toString('hex'))" > secret
-# 2) 起服务（参数是 config 路径，可省略）
+# 2) start the hub (the argument is the config path; it can be omitted)
 node src/hub.mjs ./config.json
-# 3) 健康检查（唯一免鉴权的端点）
+# 3) health check (the only endpoint without auth)
 curl http://127.0.0.1:3111/agentmemory/livez
-# 4) 写一条、搜一条
-node src/mem.mjs put --title "示例" --content "断网时也要能写" --tags demo
-node src/mem.mjs get --query "断网"
+# 4) write one memory, search one
+node src/mem.mjs put --title "demo" --content "writes must survive an outage" --tags demo
+node src/mem.mjs get --query "outage"
 ```
 
-> 中文内容请走 `--content-file` 或 `put-json --file`（UTF-8 文件体）。把非 ASCII 塞进命令行参数会被 shell 转成本地代码页，写进去就是坏数据——这是踩过的坑，不是防御性猜测。
+> For non-ASCII content use `--content-file` or `put-json --file` (a UTF-8 file body). Passing non-ASCII through argv makes the shell transcode it into the local code page — that writes corrupted bytes. This is a bug we hit, not defensive guessing.
 
-### 不用真上游也能验证
+### Verify without a real upstream
 
 ```bash
-node test/smoke.mjs       # 41 条：离线写入 → 恢复补推 → 去重 → 删除 → 墓碑 → 快照
-node test/multi-hub.mjs   # 19 条：两机一上游 → 重复收敛 → 修订传播 → 删除不复活 → 对账自愈
+node test/smoke.mjs       # 41 assertions: offline write -> replay -> dedup -> delete -> tombstones -> snapshot
+node test/multi-hub.mjs   # 19 assertions: two hubs, one upstream -> dedup -> revisions -> delete stays deleted -> reconcile self-heal
 ```
 
 ```
@@ -48,19 +56,23 @@ node test/multi-hub.mjs   # 19 条：两机一上游 → 重复收敛 → 修订
 19/19 assertions passed   (two machines, one upstream)
 ```
 
-`test/multi-hub.mjs` 里的 stub 就是最小上游（可切换在线/离线），不需要第二台机器或云主机；两个套件都在 CI 里跑。
+The stub inside `test/multi-hub.mjs` is a minimal upstream (online/offline switchable); you do not need a second machine or a cloud VM. Both suites run in CI.
 
-## 2. 为什么做这个
+## 2. Why this exists
 
-多个编码 Agent（不同客户端、不同设备）各存各的上下文时，会出现三类问题：
+When several coding agents (different clients, different machines) each keep their own context, three problems show up:
 
-1. **上游一断就写不进去。** 记忆客户端把「远端可达」当成成功判据，隧道抖一下，这条记忆就丢了。
-2. **补推会重复。** 断网期间写入、恢复后重放，同一内容在远端与本地各有一份；下一次拉取又把它当成新记录。
-3. **跨 Agent 共享会泄密。** 记忆正文里粘进过 token、私钥、带口令的 URL，一旦上浮就被所有客户端读到。
+1. **Nothing can be written while the upstream is down.** Memory clients treat "the remote answered" as success, so one blip in the tunnel loses the memory.
+2. **Replay duplicates.** Writes made offline are replayed on reconnect, so the same content ends up in two places; the next pull imports it as a new record.
+3. **Sharing leaks.** A memory body once contained a token, a private key and a URL with a password; as soon as it went upstream, every client could read it.
 
-这三个问题都不是「换一个更强的检索算法」能解决的，而是**写入语义、幂等键、作用域与脱敏**的问题。这个项目就只做这四件事。
+None of these is solved by a stronger retrieval algorithm. They are problems of **write semantics, idempotency keys, scope and redaction** — which is all this project does.
 
-## 3. 架构
+## 3. Architecture
+
+<p align="center">
+  <img src="docs/assets/flow.svg" alt="Write path: agents -> local hub -> outbox -> upstream" width="100%">
+</p>
 
 ```
  Agent A / Agent B / CLI
@@ -68,134 +80,136 @@ node test/multi-hub.mjs   # 19 条：两机一上游 → 重复收敛 → 修订
         ▼
  ┌──────────────────────────────────────────┐
  │ hub  (src/hub.mjs, 127.0.0.1:3111)       │
- │  ├─ HTTP 路由 + 单一 Bearer 鉴权         │
+ │  ├─ HTTP routes + a single Bearer check  │
  │  ├─ SQLite (node:sqlite, WAL)            │
  │  │    memories / outbox / skills / meta  │
- │  ├─ outbox 重放（60 s 轮询，显式 sync）  │
- │  └─ snap/latest.json  原子快照（tmp+rename）│
+ │  ├─ outbox replay (60 s timer, manual)   │
+ │  └─ snap/latest.json  atomic (tmp+rename)│
  └───────────────┬──────────────────────────┘
-                 │ HTTP，可失败
+                 │ HTTP, allowed to fail
                  ▼
-        127.0.0.1:3112  SSH 隧道（keepalive）→ 上游记忆服务
+        127.0.0.1:3112  SSH tunnel (keepalive) -> upstream memory service
 ```
 
-- **本机是唯一写者**，上游是被动副本。所以「本地写成功」可以立刻返回，而不会把可用性押在网络上。
-- **端口分工**：3111 永远属于本机 hub，隧道只用 3112。否则隧道会抢走 3111，客户端把上游当唯一真相，离线即失效。
-- **技能索引**：磁盘目录是唯一写者，`skills` 表只是索引；`POST /hub/skills` 直接 409。两处可写必然漂移。
+- **This machine is the only writer**; the upstream is a passive replica. That is why a local write can return immediately without betting availability on the network.
+- **Port split**: 3111 always belongs to the local hub, the tunnel uses 3112. Otherwise the tunnel would take 3111, clients would treat the upstream as the only truth, and offline would stop working.
+- **Skill index**: the directory on disk is the only writer; the `skills` table is just an index, and `POST /hub/skills` returns 409. Two writable copies always drift.
 
-## 4. 复用性：能不能脱离上游用
+## 4. Reusability: can it run without an upstream?
 
-这个仓库的定位是「记忆语义的参考实现 + 可独立运行的本地服务」，不绑定任何特定上游。
+This repository is "a reference implementation of memory semantics + a service you can run locally", bound to no particular upstream.
 
-**能独立跑的部分**
+**What runs on its own**
 
-- **环境**：Node ≥ 22.5（用内置 `node:sqlite`），**零 npm 依赖**——不需要 `npm install`，直接 `node src/hub.mjs`。
-- **配置可注入**：`node src/hub.mjs <config.json>` 或 `HUB_CONFIG=<path>`；`port / upstream / secretFile / db / snapDir / skillsDir / syncIntervalMs` 全部来自配置，没有硬编码端口、路径或主机名。
-- **上游不可达时本地照常**：写入仍返回 200、检索走本地库、快照每 5 分钟刷新、outbox 累积待补推。`livez` 返回 `upstream:"offline"` 是**正常态**，不是故障。
-- **跨机共享需要你自备上游**：只要有一个实现以下四个端点的服务即可——`GET /agentmemory/livez`、`GET /agentmemory/export`、`POST /agentmemory/remember`、`POST /agentmemory/forget`。其余端点（`smart-search`、`memories`、`import`、`hub/status`、`hub/skills*`）都是本机能力，不需要上游。
-- **不知道上游该长什么样**：看 `test/smoke.mjs` 里的 `startStub`——它就是这四个端点的最小参考实现（可切换在线/离线），冒烟测试正是靠它验证离线写入与恢复补推。
-- **多机**：每台机器各跑一个 hub，共享同一个上游即可（离线优先仍在每台机器上）。三种拓扑与成本见 [`docs/topologies.md`](docs/topologies.md)，跨机去重 / 修订 / 删除的实现见 [`docs/consistency.md`](docs/consistency.md)。
+- **Environment**: Node ≥ 22.5 (built-in `node:sqlite`), **zero npm dependencies** — no `npm install`, just `node src/hub.mjs`.
+- **Injectable config**: `node src/hub.mjs <config.json>` or `HUB_CONFIG=<path>`; `port / upstream / secretFile / db / snapDir / skillsDir / syncIntervalMs` all come from config. No hard-coded ports, paths or host names.
+- **Upstream unreachable is normal**: writes still return 200, search reads the local database, the snapshot refreshes every 5 minutes, and the outbox accumulates. `livez` reporting `upstream:"offline"` is a **normal state**, not a failure.
+- **Cross-machine sharing needs you to bring an upstream**: any service implementing four endpoints is enough — `GET /agentmemory/livez`, `GET /agentmemory/export`, `POST /agentmemory/remember`, `POST /agentmemory/forget`. Everything else (`smart-search`, `memories`, `import`, `hub/status`, `hub/skills*`) is local capability.
+- **Don't know what an upstream looks like?** Read `startStub` in `test/smoke.mjs`: it is the minimal reference implementation of those four endpoints (switchable online/offline), and the smoke test uses it to prove offline write and replay.
+- **Multiple machines**: run one hub per machine and share one upstream; offline-first stays on every machine. See [`docs/topologies.md`](docs/topologies.md) for three topologies and their costs, and [`docs/consistency.md`](docs/consistency.md) for cross-machine dedup / revisions / deletes.
 
-**明确的能力边界**
+**Explicit limits**
 
-- 检索是 LIKE + 权重（标题 3 / 标签 2 / 正文 1）+ 30 天时间衰减打分，**不是向量召回**：没有 embedding、没有语义相似度。规模上来应换 FTS5 或向量（见 ADR-008）。
-- 单写者假设：不支持多个进程同时写同一个库文件；也不支持多租户与按主体鉴权（单一 Bearer token）。
-- 没有 Docker 打包；`tools/tunnel-watchdog.py` 只在 Windows 下验证过。
+- Retrieval is LIKE + weights (title 3 / tags 2 / body 1) + a 30-day recency decay, **not vector recall**: no embeddings, no semantic similarity. At a larger scale, switch to FTS5 or vectors (see ADR-008).
+- Single-writer assumption: no two processes may write the same database file; no multi-tenancy and no per-subject auth (one shared Bearer token).
+- No Docker packaging; `tools/tunnel-watchdog.py` is only verified on Windows.
 
+## 5. Contract
 
-## 5. 契约
+Every endpoint except `livez` requires `Authorization: Bearer <secret>`.
 
-除 `livez` 外所有端点都要 `Authorization: Bearer <secret>`。
-
-| 方法 | 路径 | 作用 |
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/agentmemory/livez` | 健康检查：`upstream` 在线状态、条数、未推送数（免鉴权） |
-| GET | `/agentmemory/health` | 同上 + 技能数、上次同步时间 |
-| POST | `/agentmemory/remember` | 写入一条：`{title, content, tags, project, type, scope}` → `{success, redacted, memory}` |
-| POST | `/agentmemory/smart-search` | 检索：`{query, limit}` → `{results:[{layer, title, scope, score, content}]}` |
-| GET | `/agentmemory/memories` | 按更新时间倒序列出 |
-| GET | `/agentmemory/export` | 全量导出（也是快照格式） |
-| POST | `/agentmemory/import` | 全量/增量导入，按 id upsert |
-| POST | `/agentmemory/forget` | 删除：`{memoryIds:[...]}`，同时取消未推送的 outbox，并写入墓碑 |
-| POST | `/agentmemory/revise` | 修订：`{memoryId, title?, content?}`；保持同一 entity id，让其它机器按 LWW 覆盖旧版本 |
-| POST | `/agentmemory/sync` | 手动同步：`{upstream, pull:{pulled,added,merged,suppressed,cleaned}, push:{pending,pushed}}` |
-| POST | `/hub/reconcile` | 全量对账：按内容 id 收敛重复、按 entity id 压缩旧版本、重推缺失行、压缩过期墓碑 |
-| GET | `/hub/status` | 同步状态、上次报告、db 与快照路径 |
-| GET/POST | `/hub/skills`, `/hub/skills/reindex`, `/hub/skills/:name` | 技能索引（只读；POST 写入返回 409） |
+| GET | `/agentmemory/livez` | Health: upstream state, memory count, pending writes (no auth) |
+| GET | `/agentmemory/health` | Same plus skill count and last sync time |
+| POST | `/agentmemory/remember` | Write one: `{title, content, tags, project, type, scope}` → `{success, redacted, memory}` |
+| POST | `/agentmemory/smart-search` | Search: `{query, limit}` → `{results:[{layer, title, scope, score, content}]}` |
+| GET | `/agentmemory/memories` | List, newest update first |
+| GET | `/agentmemory/export` | Full export (also the snapshot format) |
+| POST | `/agentmemory/import` | Import (full or partial), upsert by id |
+| POST | `/agentmemory/forget` | Delete: `{memoryIds:[...]}`; also cancels queued pushes and writes a tombstone |
+| POST | `/agentmemory/revise` | Revise: `{memoryId, title?, content?}`; keeps the entity id so other machines resolve it by LWW |
+| POST | `/agentmemory/sync` | Manual sync: `{upstream, pull:{pulled,added,merged,suppressed,cleaned}, push:{pending,pushed}}` |
+| POST | `/hub/reconcile` | Full reconciliation: collapse duplicates by content id, compact versions by entity id, re-push missing rows, compact expired tombstones |
+| GET | `/hub/status` | Sync state, last report, db and snapshot paths |
+| GET/POST | `/hub/skills`, `/hub/skills/reindex`, `/hub/skills/:name` | Skill index (read-only; writes return 409) |
 
-## 6. 语义（这个项目真正的部分）
+## 6. Semantics (the part that matters)
 
-**① 写入判据是本地成功，不是上游可达。**
-`remember` 先落 SQLite、再插一条 outbox，然后才返回 200。上游离线时响应里 `upstream:"offline"`、`pendingWrites` 递增——这是正常状态，不是故障。
+**① The write criterion is local success, not upstream reachability.**
+`remember` writes SQLite, appends an outbox row, and only then returns 200. While the upstream is offline the response says `upstream:"offline"` and `pendingWrites` grows — normal state, not a failure.
 
-**② 补推的幂等键是 `upstream_id`，不是内容哈希。**
-推送成功后把上游 id 回填到本地行；拉取时若某条上游记录的 id 已出现在本地的 `upstream_id` 里，跳过。否则同一内容会以「本地 id 行 + 上游 id 行」出现两份。回归判据固定为：写入 → 推送 → 再拉取，`added: 0` 且总行数不变。
+**② The replay idempotency key is `upstream_id`, not a content hash.**
+After a successful push the upstream id is written back to the local row; on pull, an upstream record whose id already appears in some local `upstream_id` is skipped. Otherwise the same content would exist twice ("local id row" + "upstream id row"). The regression criterion is fixed: write → push → pull again, `added: 0` and the row count unchanged.
 
-**③ 作用域决定「能不能上浮」，不是「能不能看到」。**
-`global / project / agent / private` 四级。`private` **不写 outbox**，因此永远不上游、不被其它设备看到；本地仍可搜（同一台机器）。
+**③ Scope decides whether a memory may travel, not whether it is visible.**
+Four levels: `global / project / agent / private`. `private` **never writes an outbox row**, so it can never reach the upstream or another device; it is still searchable locally.
 
-**④ 脱敏发生在写入路径，早于落库。**
-5 类模式（PEM 私钥块、`sk-`/`ghp_`/`xox?`/`AKIA` 前缀、`Bearer xxx`、URL 里的 `user:pass@`、JSON 的 `api_key` 字段）在入库前替换为 `[REDACTED]`，响应返回命中数。规则式脱敏只收敛已知模式的泄漏面，不替代密钥管理。
+**④ Redaction happens on the write path, before persistence.**
+Five pattern classes (PEM private-key blocks, `sk-`/`ghp_`/`xox?`/`AKIA` prefixes, `Bearer xxx`, `user:pass@` in URLs, JSON `api_key` fields) are replaced with `[REDACTED]` before the row is stored, and the response returns the hit count. Pattern-based redaction narrows the leak surface for known shapes; it is not a substitute for secret management.
 
-**⑤ 删除先本地、再尽力转发；转发失败不回滚。**
-宁可本地少一条，也不要复活已删数据。删除时还必须清掉 outbox 里该 id 的待推送记录——否则恢复后那条写又被重放，删除会在几分钟后自己失效。
+**⑤ Delete locally first, forward best-effort; a failed forward does not roll back.**
+Better one row short locally than a deleted fact coming back. Deletion must also drop the queued push for that id — otherwise the replay recreates it and the delete silently undoes itself minutes later.
 
-**⑥ 单写者。** 不在 hub 运行时用第二个进程直接开 `hub.db`：WAL 收尾的 checkpoint 会把正在追加的尾部折掉。查看数据走 HTTP，收拢 WAL 前先停服务。
+**⑥ Single writer.** Never open `hub.db` from a second process while the hub is running: the WAL checkpoint at shutdown can clip the tail being appended. Read through HTTP, and stop the service before truncating the WAL.
 
-**⑦ 冲突是 LWW（按 `updated_at`），不是分布式共识。**
-这个场景没有并发同 id 写入；把它写成「强一致」是过度声称。
+**⑦ Conflicts are LWW (by `updated_at`), not distributed consensus.**
+This workload has no concurrent same-id writes; calling it "strongly consistent" would be over-claiming.
 
-**⑧ 跨机去重靠内容 id，不靠上游。**
-每条记忆在写入时算出 `cid`（归一化后的 project/type/title/content 的哈希），并作为 `cid:<hash>` 标签随记录上行；拉取时同 cid 只保留一行。既然上游只保证存标签，去重就不需要它新增字段——详见 `docs/consistency.md`。
+**⑧ Cross-machine dedup uses a content id, not the upstream.**
+Every memory gets a `cid` at write time (hash of the normalised project/type/title/content) and carries it upstream as a `cid:<hash>` tag; on pull, one row per cid survives. Since the upstream only has to store tags, dedup needs no new fields — see `docs/consistency.md`.
 
-**⑨ 删除写墓碑，而不是只删一行。**
-删除时记下 `cid` 墓碑、取消待推送、转发上游 forget，并追加一条 `type=tombstone` 的普通记录（带 `tomb:<cid>` 标签）。其它机器同步时看到墓碑就删掉自己的副本；墓碑 TTL（默认 30 天，`tombstoneTtlDays`）内重写同一内容返回 409，之后允许重新记录。
+**⑨ Delete writes a tombstone, not just a missing row.**
+Deletion records a `cid` tombstone, cancels the queued push, forwards a `forget` upstream, and appends an ordinary record with `type=tombstone` (tag `tomb:<cid>`). Other machines delete their copy when they see it; re-creating the same content inside the tombstone TTL (default 30 days, `tombstoneTtlDays`) returns 409, and is allowed afterwards.
 
-**⑩ 修订共享 entity id，对账负责收敛。**
-`revise` 原地更新并追加一条同 `eid` 的新版本；其它机器按 eid 命中旧版本后 LWW 覆盖，不会多出一条平行事实。历史版本与重复行由 `POST /hub/reconcile` 统一清理，它还会重推上游缺失的行（self-heal）、压缩过期墓碑。
+**⑩ Revisions share an entity id; reconciliation cleans up.**
+`revise` updates the local row in place and appends a new version with the same `eid`; other machines match the old version by eid and overwrite it by LWW, so no parallel fact appears. Historical versions and duplicates are cleaned by `POST /hub/reconcile`, which also re-pushes rows missing upstream (self-heal) and compacts expired tombstones.
 
-## 7. 检索：为什么不是向量
+## 7. Retrieval: why not vectors
 
-单机规模（个位数项目、几十条记忆）、中文子串为主。打分是：
+The workload is tens of memories across a handful of projects, mostly Chinese substring queries. The score is:
 
 ```
-命中权重：标题 3 / 标签 2 / 正文 1
+hit weights: title 3 / tags 2 / body 1
 recency = 1 / (1 + ageDays / 30)
 score   = min(1, raw * 0.85 + recency * 0.15)
 ```
 
-引入向量库需要 embedding 服务、索引重建和一条新的失败路径，而在这个规模上换不来可测的召回收益。规模上去（上万条、跨语言、语义查询）应该换 FTS5 或向量——那是另一个取舍，不是这个项目的目标。
+A vector store needs an embedding service, index rebuilds and one more failure path; at this scale it buys no measurable recall. At a larger scale (tens of thousands of rows, cross-language, semantic queries) FTS5 or vectors are the right call — a different trade-off, not this project's goal.
 
-## 8. 这次实现里学到的两个故障
+## 8. Two incidents from this build
 
-**pull 重复行。** 补推成功后本地行的 `upstream_id` 已回填，下一次拉取把同一条记录按上游 id 再插一遍。修复是拉取前按 `upstream_id` 查重；回归判据 `added: 0`。
+**Duplicate rows on pull.** After a successful push the local row already had `upstream_id`, so the next pull inserted the same record again under the upstream id. The fix dedups on `upstream_id` before inserting; the regression criterion is `added: 0`.
 
-**WAL 双开丢数。** hub 运行时用第二个进程直接打开数据库读写，收尾的 checkpoint 折掉了正在追加的尾部，丢过 6 条。修复不是加锁，而是**改架构**：单写者 + 只读走 API + 收拢 WAL 前先停服务。故障是静默的（没有报错，只是计数对不上），所以现在把「写入条数 == 查询条数」当成一条自检。
+**WAL double-open lost rows.** A second process opened the database while the hub was running; the shutdown checkpoint clipped the tail being appended and six rows vanished. The fix was not a lock but an architecture change: single writer + reads through the API + stop before truncating the WAL. The failure was silent (no error, just counts that did not add up), so "written rows == queried rows" is now a self-check.
 
-## 9. 不做什么（明确边界）
+## 9. Non-goals
 
-- 不是生产系统：单用户、双设备、约 3 周实际使用；没有压测、没有多租户、鉴权只有一个共享 secret。
-- 不是分布式系统：多机靠「追加 + 内容 id 去重 + 墓碑 + 全量对账」，不是共识协议；并发编辑同一条记忆会丢一侧（LWW）。
-- 不是记忆数据库：没有图索引、没有上下文压缩、没有 54 个 MCP 工具；这是契约子集。
-- 没有做召回评测：`docs/evaluation.md` 记录的是行为级演练，指标待测，不写成结果。
-- Docker/CI 之外没有部署产物：定位是「本机常驻的小服务」，不是可分发产品。
+- Not a production system: one user, two devices, about three weeks of real use; no load testing, no multi-tenancy, one shared secret.
+- Not a distributed system: multiple machines rely on "append + content-id dedup + tombstones + full reconciliation", not a consensus protocol; concurrent edits to one memory lose one side (LWW).
+- Not a memory database: no graph index, no context compression, not the 54 MCP tools; this is a contract subset.
+- No recall evaluation: `docs/evaluation.md` records behavioural drills, metrics are marked as not measured, and nothing is written as a result.
+- No deployment artifact beyond Docker-free CI: it is a small resident service, not a distributable product.
 
-## 10. 目录
+## 10. Layout
 
 ```
-src/hub.mjs                服务本体（HTTP + SQLite + outbox + 快照 + 技能索引）
-src/mem.mjs                显式调用桥：put / put-json / get / list / status
-tools/tunnel-watchdog.py   端口看门狗：3111/3112 掉了才拉起，避免双开
-test/smoke.mjs             端到端冒烟：41 条断言，含一个可切换在线/离线的 stub 上游
-test/multi-hub.mjs         两机一上游：19 条断言（复制 / 去重 / 修订 / 删除 / 对账自愈）
-docs/architecture.md       组件、数据模型、四条主链路、不变量
-docs/decisions.md          10 条设计决策（备选 / 取舍 / 后果）
-docs/topologies.md         三种部署拓扑：单机、双机、虚拟机/云上游与网络路径
-docs/consistency.md        跨机一致性：tags 携带 cid/eid/墓碑、对账的四个步骤与代价
-docs/evaluation.md         2026-10-28 演练记录 + 指标计划（诚实标注未测）
-docs/data-stats.md         数据规模一页（聚合口径）
+src/hub.mjs                the service (HTTP + SQLite + outbox + snapshots + skill index)
+src/mem.mjs                explicit CLI bridge: put / put-json / get / list / status
+tools/tunnel-watchdog.py   port watchdog: restarts 3111/3112 only when they are down
+test/smoke.mjs             end-to-end smoke: 41 assertions, stub upstream with online/offline
+test/multi-hub.mjs         two machines, one upstream: 19 assertions
+docs/architecture.md       components, data model, four paths, invariants
+docs/decisions.md          10 design decisions (options / choice / consequence)
+docs/topologies.md         three deployment topologies and network paths
+docs/consistency.md        cross-machine consistency: cid/eid/tombstone tags, reconciliation
+docs/evaluation.md         the 2026-10-28 drill log + metric plan (honestly unmeasured)
+docs/data-stats.md         data scale, one page
+docs/assets/banner.svg     animated banner (this page)
+docs/assets/flow.svg       animated write path (agents -> hub -> outbox -> upstream)
+README.zh-CN.md            Simplified Chinese version of this file
 ```
 
-## 11. 许可
+## 11. License
 
-MIT。见 `LICENSE`。
+MIT. See `LICENSE`.
