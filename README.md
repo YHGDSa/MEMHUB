@@ -8,7 +8,7 @@
 
 `local-first-agent-memory` · reference implementation · Node ≥ 22.5 · zero npm dependencies · [![smoke](https://github.com/YHGDSa/local-first-agent-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/YHGDSa/local-first-agent-memory/actions)
 
-> **Status: reference implementation.** This hub ran as the primary memory path for a multi-agent workflow from 2026-10-28 to 11-20, then was retired when the upstream service became usable and the workflow moved back to it. The code is kept because its **semantics** — write criterion, outbox replay, idempotent dedup, scope isolation, credential redaction, single writer, cross-machine dedup/tombstones/reconcile — are worth more than a feature list. Every claim below is covered by tests: `test/smoke.mjs` 41 assertions (single machine) + `test/multi-hub.mjs` 19 assertions (two machines, one upstream).
+> **Status: reference implementation.** The semantics here come from a private hub I ran as the primary memory path for a multi-agent workflow (2026-10-28 → 11-20: 39 memories across two machines, one WAL double-open that lost six rows). That predecessor was retired when the upstream service became usable. **This repository is the sanitised, dependency-free rewrite of those semantics, plus cross-machine dedup, tombstones and reconciliation — written in one day, which the git history will confirm.** Every behavioural claim below is covered by tests: `test/smoke.mjs` 41 assertions + `test/multi-hub.mjs` 19 assertions. Measured numbers (write availability, replay convergence, search latency) are in [`docs/evaluation.md`](docs/evaluation.md).
 
 A zero-dependency, local-first memory service: **a write succeeds locally first**, and is queued in an outbox; the upstream receives it later, when it is reachable. The goal is to turn "memory" from a store-and-query feature into an engineering component with **lifecycle constraints**. Runnable commands are in the next section.
 
@@ -199,6 +199,7 @@ src/mem.mjs                explicit CLI bridge: put / put-json / get / list / st
 tools/tunnel-watchdog.py   port watchdog: restarts 3111/3112 only when they are down
 test/smoke.mjs             end-to-end smoke: 41 assertions, stub upstream with online/offline
 test/multi-hub.mjs         two machines, one upstream: 19 assertions
+test/metrics.mjs           measurement run: write availability / replay convergence / search latency
 docs/architecture.md       components, data model, four paths, invariants
 docs/decisions.md          10 design decisions (options / choice / consequence)
 docs/topologies.md         three deployment topologies and network paths

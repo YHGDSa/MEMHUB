@@ -11,7 +11,8 @@
     "start": "node src/hub.mjs",
     "test": "node test/smoke.mjs && node test/multi-hub.mjs",
     "smoke": "node test/smoke.mjs",
-    "multi": "node test/multi-hub.mjs"
+    "multi": "node test/multi-hub.mjs",
+    "metrics": "node test/metrics.mjs"
   },
   "license": "MIT"
 }

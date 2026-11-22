@@ -635,6 +635,9 @@ route('POST', '/agentmemory/import', (body) => {
   const list = body.memories || [];
   let n = 0;
   for (const m of list) { upsertMemory({ ...m, remote: m.remote ?? false }); n++; }
+  // A bulk import is exactly when the offline copy matters most (migration,
+  // restore); refresh it instead of waiting for the next sync or the 5 min timer.
+  if (n) writeSnapshot();
   return { success: true, imported: n };
 });
 
