@@ -6,9 +6,9 @@
 
 # MEMHUB · local-first agent memory
 
-`local-first-agent-memory` · reference implementation · Node ≥ 22.5 · zero npm dependencies · [![smoke](https://github.com/YHGDSa/local-first-agent-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/YHGDSa/local-first-agent-memory/actions)
+reference implementation · Node ≥ 22.5 · zero npm dependencies · [![smoke](https://github.com/YHGDSa/local-first-agent-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/YHGDSa/local-first-agent-memory/actions)
 
-> **Status: reference implementation.** The semantics here come from a private hub I ran as the primary memory path for a multi-agent workflow (2026-10-28 → 11-20: 39 memories across two machines, one WAL double-open that lost six rows). That predecessor was retired when the upstream service became usable. **This repository is the sanitised, dependency-free rewrite of those semantics, plus cross-machine dedup, tombstones and reconciliation — written in one day, which the git history will confirm.** Every behavioural claim below is covered by tests: `test/smoke.mjs` 41 assertions + `test/multi-hub.mjs` 19 assertions. Measured numbers (write availability, replay convergence, search latency) are in [`docs/evaluation.md`](docs/evaluation.md).
+> **Status: reference implementation.** The semantics here come from a private hub I ran as the primary memory path for a multi-agent workflow (2026-10-28 → 11-20: 39 memories across two machines, one WAL double-open that lost six rows). That predecessor was retired when the upstream service became usable. **This repository is the sanitised, dependency-free rewrite of those semantics, plus cross-machine dedup, tombstones and reconciliation — written in one day, which the git history will confirm.** Every behavioural claim below is covered by tests: `test/smoke.mjs` 42 assertions + `test/multi-hub.mjs` 19 assertions. Measured numbers (write availability, replay convergence, search latency) are in [`docs/evaluation.md`](docs/evaluation.md).
 
 A zero-dependency, local-first memory service: **a write succeeds locally first**, and is queued in an outbox; the upstream receives it later, when it is reachable. The goal is to turn "memory" from a store-and-query feature into an engineering component with **lifecycle constraints**. Runnable commands are in the next section.
 
@@ -47,12 +47,12 @@ node src/mem.mjs get --query "outage"
 ### Verify without a real upstream
 
 ```bash
-node test/smoke.mjs       # 41 assertions: offline write -> replay -> dedup -> delete -> tombstones -> snapshot
+node test/smoke.mjs       # 42 assertions: offline write -> replay -> dedup -> delete -> tombstones -> snapshot
 node test/multi-hub.mjs   # 19 assertions: two hubs, one upstream -> dedup -> revisions -> delete stays deleted -> reconcile self-heal
 ```
 
 ```
-41/41 assertions passed   (single machine)
+41/42 assertions passed   (single machine)
 19/19 assertions passed   (two machines, one upstream)
 ```
 
@@ -197,7 +197,7 @@ A vector store needs an embedding service, index rebuilds and one more failure p
 src/hub.mjs                the service (HTTP + SQLite + outbox + snapshots + skill index)
 src/mem.mjs                explicit CLI bridge: put / put-json / get / list / status
 tools/tunnel-watchdog.py   port watchdog: restarts 3111/3112 only when they are down
-test/smoke.mjs             end-to-end smoke: 41 assertions, stub upstream with online/offline
+test/smoke.mjs             end-to-end smoke: 42 assertions, stub upstream with online/offline
 test/multi-hub.mjs         two machines, one upstream: 19 assertions
 test/metrics.mjs           measurement run: write availability / replay convergence / search latency
 docs/architecture.md       components, data model, four paths, invariants

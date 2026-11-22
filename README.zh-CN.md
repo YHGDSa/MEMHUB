@@ -6,9 +6,9 @@
 
 # MEMHUB · 本地优先 Agent 记忆层
 
-`local-first-agent-memory` · 参考实现 · Node ≥ 22.5 · 零 npm 依赖 · [![smoke](https://github.com/YHGDSa/local-first-agent-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/YHGDSa/local-first-agent-memory/actions)
+参考实现 · Node ≥ 22.5 · 零 npm 依赖 · [![smoke](https://github.com/YHGDSa/local-first-agent-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/YHGDSa/local-first-agent-memory/actions)
 
-> **状态：参考实现。** 这里的语义来自一个自用的本地优先 hub：它在 2026-10-28 ~ 11-20 作为多 Agent 工作流的主记忆通道实际运行（39 条记忆、2 台设备、一次 WAL 双开事故丢了 6 条）；上游服务恢复可用后归档停用。**本仓库是把这套语义脱敏重写、并补上跨机去重/墓碑/对账的零依赖参考实现——一天写完，git 历史可以作证。** 下面每一条行为都由测试兜底：`test/smoke.mjs` 41 条 + `test/multi-hub.mjs` 19 条；实测数字（写入可用性、补推收敛、检索延迟）见 [`docs/evaluation.md`](docs/evaluation.md)。
+> **状态：参考实现。** 这里的语义来自一个自用的本地优先 hub：它在 2026-10-28 ~ 11-20 作为多 Agent 工作流的主记忆通道实际运行（39 条记忆、2 台设备、一次 WAL 双开事故丢了 6 条）；上游服务恢复可用后归档停用。**本仓库是把这套语义脱敏重写、并补上跨机去重/墓碑/对账的零依赖参考实现——一天写完，git 历史可以作证。** 下面每一条行为都由测试兜底：`test/smoke.mjs` 42 条 + `test/multi-hub.mjs` 19 条；实测数字（写入可用性、补推收敛、检索延迟）见 [`docs/evaluation.md`](docs/evaluation.md)。
 
 一个零第三方依赖的本地优先记忆服务：**写入先落本地并返回成功**，同时投递 outbox；上游可用时按序补推，不可用时保留重试。目标是把「记忆」从「能存能查」做成一套**有生命周期约束**的工程件。能跑的命令在下一节。
 
@@ -47,12 +47,12 @@ node src/mem.mjs get --query "断网"
 ### 不用真上游也能验证
 
 ```bash
-node test/smoke.mjs       # 41 条：离线写入 → 恢复补推 → 去重 → 删除 → 墓碑 → 快照
+node test/smoke.mjs       # 42 条：离线写入 → 恢复补推 → 去重 → 删除 → 墓碑 → 快照
 node test/multi-hub.mjs   # 19 条：两机一上游 → 重复收敛 → 修订传播 → 删除不复活 → 对账自愈
 ```
 
 ```
-41/41 assertions passed   (single machine)
+41/42 assertions passed   (single machine)
 19/19 assertions passed   (two machines, one upstream)
 ```
 
@@ -198,7 +198,7 @@ score   = min(1, raw * 0.85 + recency * 0.15)
 src/hub.mjs                服务本体（HTTP + SQLite + outbox + 快照 + 技能索引）
 src/mem.mjs                显式调用桥：put / put-json / get / list / status
 tools/tunnel-watchdog.py   端口看门狗：3111/3112 掉了才拉起，避免双开
-test/smoke.mjs             端到端冒烟：41 条断言，含一个可切换在线/离线的 stub 上游
+test/smoke.mjs             端到端冒烟：42 条断言，含一个可切换在线/离线的 stub 上游
 test/multi-hub.mjs         两机一上游：19 条断言（复制 / 去重 / 修订 / 删除 / 对账自愈）
 test/metrics.mjs           测量脚本：写入可用性 / 补推收敛 / 检索延迟（不断言）
 docs/architecture.md       组件、数据模型、四条主链路、不变量
