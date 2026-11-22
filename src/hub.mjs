@@ -347,9 +347,14 @@ function writeSnapshot() {
     skills: skills.map((s) => ({ ...s, files: JSON.parse(s.files), tags: JSON.parse(s.tags) })),
   };
   const tmp = join(SNAP_DIR, '.latest.json.tmp');
-  writeFileSync(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
-  renameSync(tmp, join(SNAP_DIR, 'latest.json'));
-  return snapshot.count;
+  try {
+    writeFileSync(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
+    renameSync(tmp, join(SNAP_DIR, 'latest.json'));
+  } catch (error) {
+    // SQLite is already committed. A backup write failure must not stop replay
+    // or make a successful mutation look as though it needs to be retried.
+    console.error('[hub] snapshot failed', error.message);
+  }
 }
 
 async function pullUpstream() {
