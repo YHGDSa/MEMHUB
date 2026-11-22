@@ -237,11 +237,15 @@ try {
   check('stored content is masked', storedBody.includes('[REDACTED]'));
 
   console.log('\n4. recovery + replay');
+  const blockedSnapshot = join(snapDir, 'latest.json');
+  mkdirSync(blockedSnapshot); // Atomic rename cannot replace a directory.
   stub.state.online = true;
   const sync1 = await syncStable();
+  rmSync(blockedSnapshot, { recursive: true });
   check('sync reached upstream', sync1.upstream === true, JSON.stringify(sync1));
+  eq('snapshot write failure does not mark upstream offline', sync1.error, undefined);
   const livez3 = (await api('GET', '/agentmemory/livez')).body;
-  eq('outbox drained', livez3.pendingWrites, 0);
+  eq('outbox drained even when snapshot could not be written', livez3.pendingWrites, 0);
   eq('upstream received exactly the non-private writes', stub.state.memories.length, 2);
   check('upstream copy is already redacted', !stub.state.memories.some((m) => JSON.stringify(m).includes('abcdefghijklmnopqrstuvwx')));
   check('private write never reached upstream', !stub.state.memories.some((m) => m.title === '私密草稿'));
